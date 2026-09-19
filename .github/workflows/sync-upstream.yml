@@ -19,6 +19,8 @@ jobs:
 
       - name: Sync upstream
         run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
           git remote add upstream https://github.com/pingmike2/cline2api-workers.git
           git fetch upstream
           git merge upstream/main --no-edit
