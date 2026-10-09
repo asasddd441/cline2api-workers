@@ -9,8 +9,9 @@
  *  3. SSE 流式响应剥掉上游 {data:{...}} 包装，透传给客户端
  *
  * 环境变量：
- *  - CLINE_REFRESH_TOKEN (必需)  Cline 账号的 refreshToken
+ *  - CLINE_REFRESH_TOKEN (必需)  Cline 账号的 refreshToken（多行 = 多账号）
  *  - API_KEY                (可选) 自定义访问 key；不设置则每次部署随机生成并打印到日志
+ *  - ACCOUNT_STRATEGY       (可选) 多账号调度: round-robin(默认) / random / fill-first
  *
  * 用法（OpenAI 兼容）：
  *   curl https://你的worker/v1/chat/completions \
@@ -23,7 +24,8 @@ const CLINE_API_BASE = "https://api.cline.bot/api/v1";
 
 // 账号池：支持多个 Cline 账号，每个账号独立缓存 accessToken
 // CLINE_REFRESH_TOKEN 环境变量可包含多行，每行一个 refreshToken，
-// 额度用尽(空响应)时自动轮换下一个账号。
+// 调度策略由 ACCOUNT_STRATEGY 控制（默认 round-robin 轮流用号），
+// 额度用尽(空响应)/限流时自动冷却当前账号并切换到下一个。
 // 结构：{ refreshToken, accessToken, expiry, cooldownUntil }
 let accounts = [];
 let accountIndex = 0;          // round-robin 游标
@@ -134,7 +136,7 @@ async function refreshFreeModels() {
 // 默认模型：Cline 免费 DeepSeek V4.1 Flash 通道（cline-free/ 官方免费额度，无需 credits）
 // 逆向自官方插件 recommended-models free 列表：cline-free/deepseek-v4.1-flash
 const DEFAULT_MODEL = "cline-free/deepseek-v4.1-flash";
-const VERSION = "1.1.8";
+const VERSION = "1.1.9";
 
 export default {
   async fetch(request, env) {
@@ -156,6 +158,7 @@ export default {
         version: VERSION,
         authenticated: !!(env.API_KEY),
         accounts: poolN,
+        strategy: parseStrategy(env),
         model: DEFAULT_MODEL,
       }, 200);
     }
@@ -254,17 +257,36 @@ async function getAccountToken(account) {
   return accessToken;
 }
 
-// 轮询选择一个可用账号，返回该账号对象（并设置 currentAccount）
-function pickAccount(pool) {
-  for (let k = 0; k < pool.length; k++) {
-    const acc = pool[accountIndex % pool.length];
-    accountIndex = (accountIndex + 1) % pool.length;
-    if (!acc.cooldownUntil || acc.cooldownUntil <= Date.now()) {
-      currentAccount = acc;
-      return acc;
+// 账号调度策略（环境变量 ACCOUNT_STRATEGY，v1.1.9）：
+//  - round-robin (默认): 请求轮流使用各账号 1→2→3→1→…，均匀分摊用量。
+//    游标是 isolate 内存变量：本代理有全局串行队列，单 isolate 内严格轮转；
+//    多 isolate 并存/冷启动时为近似均匀（要求严格均匀可用 random）。
+//  - random:           每次请求随机洗牌选号，多 isolate 下分布最均匀。
+//  - fill-first:       黏住列表第一个健康账号，冷却/刷新失败才切下一个
+//                      （= v1.1.8 及以前版本的实际行为，当时宣称 round-robin 但从未生效）。
+function parseStrategy(env) {
+  const s = (env.ACCOUNT_STRATEGY || "").trim().toLowerCase();
+  if (s === "random") return "random";
+  if (s === "fill-first" || s === "fill_first" || s === "fillfirst") return "fill-first";
+  return "round-robin";
+}
+
+// 按调度策略生成本次请求尝试账号的下标顺序（冷却跳过与失败切换由 getAccessToken 处理）
+function candidateOrder(n, strategy) {
+  const idx = [...Array(n).keys()];
+  if (strategy === "fill-first") return idx;
+  if (strategy === "random") {
+    // Fisher-Yates 洗牌：随机顺序尝试
+    for (let i = n - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [idx[i], idx[j]] = [idx[j], idx[i]];
     }
+    return idx;
   }
-  return null; // 全部冷却中
+  // round-robin：从游标处旋转一周，游标前移一位
+  const start = accountIndex % n;
+  accountIndex = (accountIndex + 1) % n;
+  return idx.map((k) => (start + k) % n);
 }
 
 async function getAccessToken(env) {
@@ -272,20 +294,20 @@ async function getAccessToken(env) {
   if (pool.length === 0) {
     throw new Error("缺少 CLINE_REFRESH_TOKEN 环境变量");
   }
-  // 最多尝试 pool.length 个账号（跳过冷却/刷新失败的）
-  for (let attempt = 0; attempt < pool.length; attempt++) {
-    const acc = pool[attempt % pool.length]; // 逐个尝试
+  // 按策略顺序尝试账号（跳过冷却中的；刷新失败自动切下一个）
+  const order = candidateOrder(pool.length, parseStrategy(env));
+  for (const i of order) {
+    const acc = pool[i];
     if (acc.cooldownUntil && acc.cooldownUntil > Date.now()) continue;
     currentAccount = acc;
     try {
       return await getAccountToken(acc);
     } catch (e) {
-      if (e.message === "account_cooldown") continue;
-      continue; // 刷新失败也切下个号
+      continue; // 刷新失败也切下个号（getAccountToken 内已给该账号设置了冷却）
     }
   }
-  // 全部失败，清冷却重试一次最早的
-  const acc = pool[0];
+  // 全部冷却/失败，清掉首选账号的冷却重试一次
+  const acc = pool[order[0]];
   currentAccount = acc;
   acc.cooldownUntil = 0;
   try {
