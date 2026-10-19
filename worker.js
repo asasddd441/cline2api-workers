@@ -34,7 +34,10 @@ let currentAccount = null;     // 当前正在使用的账号（串行队列下�
 // 模型列表：原样使用 Cline /v1/models 返回的完整模型 ID。
 // 不人为添加 cline/ 前缀；Telegram 会完整显示这些 ID，避免不同供应商模型名被截断后混淆。
 const MODELS = [
-  { id: "cline-free/deepseek-v4.1-flash", upstream: "cline-free/deepseek-v4.1-flash", provider: "cline", cost: "free" },
+  { id: "cline-free/nemotron-3.5-super-vl", upstream: "cline-free/nemotron-3.5-super-vl", provider: "cline", cost: "free" },
+  { id: "cline-free/mimo-v2.6-flash", upstream: "cline-free/mimo-v2.6-flash", provider: "cline", cost: "free" },
+  { id: "cline-free/muse-spark-1.3-contributor", upstream: "cline-free/muse-spark-1.3-contributor", provider: "cline", cost: "free" },
+  { id: "cline-free/solar-mini4", upstream: "cline-free/solar-mini4", provider: "cline", cost: "free" },
   { id: "deepseek/deepseek-v4-flash", upstream: "deepseek/deepseek-v4-flash", provider: "deepseek", cost: "free" },
   { id: "poolside/laguna-s-2.1:free", upstream: "poolside/laguna-s-2.1:free", provider: "poolside", cost: "free" },
   { id: "cline-pass/glm-5.2", upstream: "cline-pass/glm-5.2", provider: "zai", cost: "pass" },
@@ -76,9 +79,10 @@ async function refreshModels() {
       "xiaomi/mimo-v2.5",
       "minimax/minimax-m3",
       "poolside/laguna-s-2.1",
-      "cline-free/deepseek-v4.1-flash",
+      "cline-free/nemotron-3.5-super-vl",
+      "cline-free/mimo-v2.6-flash",
       "cline-free/muse-spark-1.3-contributor",
-      "cline-free/solar-pro4",
+      "cline-free/solar-mini4",
     ];
     const baseList = data.data
       .filter((m) => {
@@ -133,10 +137,10 @@ async function refreshFreeModels() {
   }
 }
 
-// 默认模型：Cline 免费 DeepSeek V4.1 Flash 通道（cline-free/ 官方免费额度，无需 credits）
-// 逆向自官方插件 recommended-models free 列表：cline-free/deepseek-v4.1-flash
-const DEFAULT_MODEL = "cline-free/deepseek-v4.1-flash";
-const VERSION = "1.1.9";
+// 默认模型：Cline 官方免费通道（2026-10 名单：nemotron-3.5-super-vl / mimo-v2.6-flash /
+//   muse-spark-1.3-contributor / solar-mini4）。deepseek-v4.1-flash 已被官方下架。
+const DEFAULT_MODEL = "cline-free/nemotron-3.5-super-vl";
+const VERSION = "1.2.0";
 
 export default {
   async fetch(request, env) {
