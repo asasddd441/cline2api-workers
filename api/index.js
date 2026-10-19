@@ -83,6 +83,7 @@ async function refreshModels() {
       "cline-free/mimo-v2.6-flash",
       "cline-free/muse-spark-1.3-contributor",
       "cline-free/solar-mini4",
+      "cline-free/minimax-m3.1-flash",
     ];
     const baseList = data.data
       .filter((m) => {
@@ -140,7 +141,7 @@ async function refreshFreeModels() {
 // 默认模型：Cline 官方免费通道（2026-10 名单：nemotron-3.5-super-vl / mimo-v2.6-flash /
 //   muse-spark-1.3-contributor / solar-mini4）。deepseek-v4.1-flash 已被官方下架。
 const DEFAULT_MODEL = "cline-free/nemotron-3.5-super-vl";
-const VERSION = "1.2.2";
+const VERSION = "1.2.3";
 
 // =====================================================================
 // Vercel Edge Function 入口
