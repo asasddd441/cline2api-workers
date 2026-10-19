@@ -140,7 +140,7 @@ async function refreshFreeModels() {
 // 默认模型：Cline 官方免费通道（2026-10 名单：nemotron-3.5-super-vl / mimo-v2.6-flash /
 //   muse-spark-1.3-contributor / solar-mini4）。deepseek-v4.1-flash 已被官方下架。
 const DEFAULT_MODEL = "cline-free/nemotron-3.5-super-vl";
-const VERSION = "1.2.0";
+const VERSION = "1.2.2";
 
 export default {
   async fetch(request, env) {
@@ -327,6 +327,7 @@ function clineHeaders(sessionId) {
   return {
     Authorization: "Bearer workos:" + currentToken,
     "Content-Type": "application/json",
+    "Accept-Encoding": "identity",
     "User-Agent": "Cline/3.0.47",
     "HTTP-Referer": "https://cline.bot",
     "X-Title": "Cline",
@@ -401,6 +402,53 @@ function parseCooldown(body, status) {
   return 60 * 1000;
 }
 
+// ---- 流式探测（issue #8 修复配套）----
+// 判定一段（首个）上游片段是否是"限流/空响应"信号（伪装成 200 SSE 的错误）
+function isLimitSignal(text) {
+  if (!text) return false;
+  return text.includes("empty response content") ||
+         text.includes("Daily free limit") ||
+         text.includes("INFERENCE_CAP_ERROR");
+}
+
+// 读上游响应的第一个 chunk（严格限量，不碰后续流），读到的字节原样返回。
+// 调用方必须把 head 重新接回流（reattachStreamHead），否则数据丢失。
+async function peekStreamHead(resp, maxWaitMs) {
+  try {
+    const reader = resp.body.getReader();
+    const timer = new Promise((resolve) => setTimeout(() => resolve({ done: true, value: undefined }), maxWaitMs));
+    const first = await Promise.race([reader.read(), timer]);
+    if (first.done) {
+      try { reader.releaseLock(); } catch {}
+      return { head: "" };
+    }
+    reader.releaseLock(); // 解锁后流仍可继续被 streamResponse 消费（首 chunk 已在缓冲区外）
+    const chunk = first.value;
+    // 半字节安全的解码（CF 环境忽略）
+    const head = new TextDecoder().decode(chunk.slice(0), { stream: true });
+    return { head, chunk };
+  } catch (e) {
+    return { head: "" };
+  }
+}
+
+// 把探测时读走的首个 chunk 拼回响应流：新建 TransformStream，先写 chunk，再 pipeRemaining
+function reattachStreamHead(resp, headChunk) {
+  if (!headChunk || !resp.body) return resp; // 无探测（如探测失败）：原样转发
+  const { readable, writable } = new TransformStream();
+  (async () => {
+    const writer = writable.getWriter();
+    try {
+      await writer.write(headChunk);
+      writer.releaseLock();        // ⚠️ pipeTo 要求 writable 未被锁；不释放会直接抛错断流
+      await resp.body.pipeTo(writable);
+    } catch (e) {
+      try { await writer.abort(); } catch {}
+    }
+  })();
+  return new Response(readable, { status: resp.status, headers: resp.headers });
+}
+
 // 带重试的 clineFetch：429限流/空响应/5xx 自动切换账号 + 指数退避重试
 // 一个号额度用完或限流(429 Daily free limit reached)时：
 //   - 冷却该账号（冷却时长按上游提示，如 2h51m）
@@ -414,19 +462,30 @@ async function clineFetchWithRetry(env, path, bodyObj, sessionId, isStream = fal
     lastResp = resp;
 
     // 统一读 body（clone 不消耗流）
+    // ⚠️ 流式响应绝不能 clone().text()——那会把整个上游流缓冲完才转发，客户端等到
+    //    生成完毕才一次性收到全部 chunk（issue #8 的根因）。流式只探测首个 chunk。
     let bodyText = "";
+    let headChunk = null; // 流式：探测出的首个上游 chunk（原样放回流）
     try {
-      bodyText = await resp.clone().text();
+      if (isStream && resp.ok && resp.body) {
+        const peek = await peekStreamHead(resp, 3000);
+        bodyText = peek.head;
+        headChunk = peek.chunk; // 字节；写回流时保持原样
+      } else {
+        bodyText = await resp.clone().text();
+      }
     } catch (e) {}
 
     // 判定"额度/限流"信号（需要切号）：
     // 1. 429（Daily free limit reached / rate limit）
     // 2. 5xx 且含 empty response content
     // 3. 200 非流式但 body 是空响应包装
+    // 4. 200 流式但首个 chunk 就带 error/empty（限流也伪装成 200 SSE）
     const isLimitHit =
       resp.status === 429 ||
       (resp.status >= 500 && bodyText.includes("empty response content")) ||
-      (resp.ok && !isStream && bodyText.includes("empty response content"));
+      (resp.ok && !isStream && bodyText.includes("empty response content")) ||
+      (resp.ok && isStream && isLimitSignal(bodyText));
 
     if (isLimitHit) {
       const cooldownMs = parseCooldown(bodyText, resp.status);
@@ -443,13 +502,15 @@ async function clineFetchWithRetry(env, path, bodyObj, sessionId, isStream = fal
         console.log(`[retry] 所有账号均冷却，直接返回上游响应`);
         return resp; // 不空转，把 429/错误返回给客户端
       }
+      // 丢弃该响应（流式流已被 peek 打开；非流式 clone 挂着）——显式 cancel 防资源泄漏
+      try { if (resp.body) await resp.body.cancel(); } catch {}
       await sleep(500 + Math.floor(Math.random() * 500));
       continue;
     }
 
     // 正常响应（200）
     if (resp.ok) {
-      if (isStream) return resp; // 流式：直接转发
+      if (isStream) return reattachStreamHead(resp, headChunk); // 流式：首个 chunk 已由探测读走，回填后转发
       return resp;               // 非流式：body 已确认非空响应
     }
 

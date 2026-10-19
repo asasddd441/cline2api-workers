@@ -140,7 +140,7 @@ async function refreshFreeModels() {
 // 默认模型：Cline 官方免费通道（2026-10 名单：nemotron-3.5-super-vl / mimo-v2.6-flash /
 //   muse-spark-1.3-contributor / solar-mini4）。deepseek-v4.1-flash 已被官方下架。
 const DEFAULT_MODEL = "cline-free/nemotron-3.5-super-vl";
-const VERSION = "1.2.0";
+const VERSION = "1.2.2";
 
 // =====================================================================
 // Vercel Edge Function 入口
@@ -351,6 +351,7 @@ function clineHeaders(sessionId) {
   return {
     Authorization: "Bearer workos:" + currentToken,
     "Content-Type": "application/json",
+    "Accept-Encoding": "identity",
     "User-Agent": "Cline/3.0.47",
     "HTTP-Referer": "https://cline.bot",
     "X-Title": "Cline",
@@ -430,6 +431,48 @@ function parseCooldown(body, status) {
 //   - 冷却该账号（冷却时长按上游提示，如 2h51m）
 //   - 自动轮换到下一个号重试同一请求
 // 所有账号都冷却时，直接返回原始响应（不空转）
+// ---- 流式探测（issue #8 修复配套）----
+function isLimitSignal(text) {
+  if (!text) return false;
+  return text.includes("empty response content") ||
+         text.includes("Daily free limit") ||
+         text.includes("INFERENCE_CAP_ERROR");
+}
+
+async function peekStreamHead(resp, maxWaitMs) {
+  try {
+    const reader = resp.body.getReader();
+    const timer = new Promise((resolve) => setTimeout(() => resolve({ done: true, value: undefined }), maxWaitMs));
+    const first = await Promise.race([reader.read(), timer]);
+    if (first.done) {
+      try { reader.releaseLock(); } catch {}
+      return { head: "", chunk: null };
+    }
+    reader.releaseLock();
+    const chunk = first.value;
+    const head = new TextDecoder().decode(chunk, { stream: true });
+    return { head, chunk };
+  } catch (e) {
+    return { head: "", chunk: null };
+  }
+}
+
+function reattachStreamHead(resp, headChunk) {
+  if (!headChunk || !resp.body) return resp;
+  const { readable, writable } = new TransformStream();
+  (async () => {
+    const writer = writable.getWriter();
+    try {
+      await writer.write(headChunk);
+      writer.releaseLock();        // ⚠️ pipeTo 要求 writable 未被锁；不释放会直接抛错断流
+      await resp.body.pipeTo(writable);
+    } catch (e) {
+      try { await writer.abort(); } catch {}
+    }
+  })();
+  return new Response(readable, { status: resp.status, headers: resp.headers });
+}
+
 async function clineFetchWithRetry(env, path, bodyObj, sessionId, isStream = false, maxRetries = 4) {
   let lastResp = null;
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
@@ -439,18 +482,27 @@ async function clineFetchWithRetry(env, path, bodyObj, sessionId, isStream = fal
 
     // 统一读 body（clone 不消耗流）
     let bodyText = "";
+    let headChunk = null;
     try {
-      bodyText = await resp.clone().text();
+      if (isStream && resp.ok && resp.body) {
+        const peek = await peekStreamHead(resp, 3000);
+        bodyText = peek.head;
+        headChunk = peek.chunk || null;
+      } else {
+        bodyText = await resp.clone().text();
+      }
     } catch (e) {}
 
     // 判定"额度/限流"信号（需要切号）：
     // 1. 429（Daily free limit reached / rate limit）
     // 2. 5xx 且含 empty response content
     // 3. 200 非流式但 body 是空响应包装
+    // 4. 200 流式但首个 chunk 就是限流/空响应信号
     const isLimitHit =
       resp.status === 429 ||
       (resp.status >= 500 && bodyText.includes("empty response content")) ||
-      (resp.ok && !isStream && bodyText.includes("empty response content"));
+      (resp.ok && !isStream && bodyText.includes("empty response content")) ||
+      (resp.ok && isStream && isLimitSignal(bodyText));
 
     if (isLimitHit) {
       const cooldownMs = parseCooldown(bodyText, resp.status);
@@ -467,13 +519,14 @@ async function clineFetchWithRetry(env, path, bodyObj, sessionId, isStream = fal
         console.log(`[retry] 所有账号均冷却，直接返回上游响应`);
         return resp; // 不空转，把 429/错误返回给客户端
       }
+      try { if (resp.body) await resp.body.cancel(); } catch {}
       await sleep(500 + Math.floor(Math.random() * 500));
       continue;
     }
 
     // 正常响应（200）
     if (resp.ok) {
-      if (isStream) return resp; // 流式：直接转发
+      if (isStream) return reattachStreamHead(resp, headChunk); // 流式：首 chunk 由探测读走，回填再转发
       return resp;               // 非流式：body 已确认非空响应
     }
 
