@@ -309,10 +309,24 @@ User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML,
 ```text
 Base URL: https://cline2api.<你的子域>.workers.dev/v1   （或 https://<项目名>.vercel.app/v1）
 API Key:  <你设置的 API_KEY>
-Model:    cline-free/deepseek-v4.1-flash   （默认，免费）
+Model:    cline-free/nemotron-3.5-super-vl   （默认，免费）
 ```
 
 兼容 OpenAI 客户端（`/v1/chat/completions`）和 Anthropic 客户端（`/v1/messages`，自动转换）。
+
+### Claude Code CLI ✅ (v1.3.0)
+
+完整支持 Claude Code（含工具调用：Write/Bash/Read 等多轮 agent 任务），配置：
+
+```bash
+export ANTHROPIC_BASE_URL="https://cline2api.<你的子域>.workers.dev"
+export ANTHROPIC_AUTH_TOKEN="<你设置的 API_KEY>"   # Claude Code 用这个头
+export ANTHROPIC_API_KEY="$ANTHROPIC_AUTH_TOKEN"
+# 模型用 GET /v1/models 里任一 cline-free/* 免费模型
+claude -p "your task" --model cline-free/nemotron-3.5-super-vl
+```
+
+提示：「doesn't recognize the model, assuming 200k context」是正常警告（模型名非 Anthropic 官方，CC 按 200k 窗口处理），可忽略。
 
 ### 可用模型（实测）
 
