@@ -141,7 +141,7 @@ async function refreshFreeModels() {
 // 默认模型：Cline 官方免费通道（2026-10 名单：nemotron-3.5-super-vl / mimo-v2.6-flash /
 //   muse-spark-1.3-contributor / solar-mini4）。deepseek-v4.1-flash 已被官方下架。
 const DEFAULT_MODEL = "cline-free/nemotron-3.5-super-vl";
-const VERSION = "1.2.3";
+const VERSION = "1.3.0";
 
 // =====================================================================
 // Vercel Edge Function 入口
@@ -204,6 +204,20 @@ async function clineFetchHandler(request, env) {
       }
       if (url.pathname === "/v1/messages" || url.pathname === "/messages") {
         return handleAnthropic(request, env);
+      }
+      // Anthropic count_tokens：Claude Code 每轮调用，粗估 chars/4
+      if (url.pathname === "/v1/messages/count_tokens" || url.pathname === "/messages/count_tokens") {
+        try {
+          const req = await request.json();
+          let chars = 0;
+          if (req.system) chars += typeof req.system === "string" ? req.system.length : JSON.stringify(req.system).length;
+          for (const m of req.messages || []) {
+            chars += typeof m.content === "string" ? m.content.length : JSON.stringify(m.content).length;
+          }
+          return jsonResponse({ input_tokens: Math.ceil(chars / 4) }, 200);
+        } catch {
+          return jsonResponse({ input_tokens: 0 }, 200);
+        }
       }
     }
 
@@ -760,6 +774,35 @@ async function handleAnthropic(request, env) {
     messages.push({ role: "system", content: sysContent });
   }
   for (const m of req.messages || []) {
+    if (typeof m.content === "string") {
+      messages.push({ role: m.role, content: m.content });
+      continue;
+    }
+    if (Array.isArray(m.content)) {
+      const parts = [];
+      const toolCalls = [];
+      const toolResults = [];
+      for (const blk of m.content) {
+        if (blk?.type === "text") parts.push(blk.text || "");
+        else if (blk?.type === "tool_use") {
+          toolCalls.push({ id: blk.id, type: "function", function: { name: blk.name, arguments: JSON.stringify(blk.input || {}) } });
+        } else if (blk?.type === "tool_result") {
+          const inner = typeof blk.content === "string" ? blk.content
+            : Array.isArray(blk.content) ? blk.content.filter((x) => x?.type === "text").map((x) => x.text).join("\n")
+            : JSON.stringify(blk.content ?? "");
+          toolResults.push({ role: "tool", tool_call_id: blk.tool_use_id || blk.id || "", content: inner });
+        } else if (blk?.type === "image") {
+          parts.push("[image omitted]");
+        }
+      }
+      if (toolResults.length > 0) messages.push(...toolResults);
+      if (toolCalls.length > 0) {
+        messages.push({ role: "assistant", content: parts.join("\n") || "", tool_calls: toolCalls });
+      } else if (parts.length > 0) {
+        messages.push({ role: m.role, content: parts.join("\n") });
+      }
+      continue;
+    }
     const content = typeof m.content === "string" ? m.content : JSON.stringify(m.content);
     messages.push({ role: m.role, content });
   }
@@ -791,7 +834,7 @@ async function handleAnthropic(request, env) {
     }
     if (isStream) {
       // 上游是 OpenAI SSE，转成 Anthropic SSE 格式
-      return streamResponseAnthropic(resp);
+      return streamResponseAnthropic(resp, requestedModel);
     }
     if (forceStream) {
       // 客户端要非流式 + 上游是流式：聚合后再转 Anthropic
@@ -880,7 +923,7 @@ async function streamResponse(upstream, externalModel) {
 }
 
 // Anthropic SSE：把上游 OpenAI chunk 转成 Anthropic 格式
-async function streamResponseAnthropic(upstream) {
+async function streamResponseAnthropic(upstream, externalModel) {
   const { readable, writable } = new TransformStream();
   const writer = writable.getWriter();
   const reader = upstream.body.getReader();
@@ -888,6 +931,14 @@ async function streamResponseAnthropic(upstream) {
   const encoder = new TextEncoder();
 
   let buf = "";
+  let modelId = externalModel || "";
+  let messageId = "msg_" + Date.now();
+  let messageStarted = false;
+  let textBlockOpen = false;   // 当前文本 content_block 是否已 start
+  const toolBlocks = new Map(); // toolIndex -> { id, name, started }
+  let nextToolIndex = 0;
+  const sse = (event, data) => encoder.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+
   (async () => {
     try {
       while (true) {
@@ -898,30 +949,86 @@ async function streamResponseAnthropic(upstream) {
         while ((idx = buf.indexOf("\n")) >= 0) {
           const line = buf.slice(0, idx);
           buf = buf.slice(idx + 1);
-          if (line.startsWith("data:")) {
-            const payload = line.slice(5).trim();
-            if (payload === "" || payload === "[DONE]") continue;
-            try {
-              const obj = JSON.parse(payload);
-              const normalized = unwrapData(obj);
-              const choice = normalized?.choices?.[0];
-              if (!choice) continue;
-              const delta = choice.delta || {};
-              if (delta.content) {
-                await writer.write(encoder.encode("event: content_block_delta\ndata: " + JSON.stringify({ type: "content_block_delta", index: 0, delta: { type: "text_delta", text: delta.content } }) + "\n\n"));
+          if (!line.startsWith("data:")) continue;
+          const payload = line.slice(5).trim();
+          if (payload === "" || payload === "[DONE]") continue;
+          try {
+            const obj = JSON.parse(payload);
+            const normalized = unwrapData(obj);
+            if (normalized?.model && !modelId) modelId = normalized.model;
+            const choice = normalized?.choices?.[0];
+            if (!choice) continue;
+            const delta = choice.delta || {};
+            const fr = choice.finish_reason;
+
+            // message_start 只发一次
+            if (!messageStarted) {
+              messageStarted = true;
+              await writer.write(sse("message_start", {
+                type: "message_start",
+                message: { id: messageId, type: "message", role: "assistant", model: modelId, content: [], stop_reason: null, usage: { input_tokens: 0, output_tokens: 0 } },
+              }));
+            }
+
+            // 文本增量 → text content_block（首个文本 delta 前 open block）
+            if (delta.content) {
+              if (!textBlockOpen) {
+                textBlockOpen = true;
+                await writer.write(sse("content_block_start", { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } }));
               }
-              if (delta.tool_calls && delta.tool_calls.length > 0) {
-                for (const tc of delta.tool_calls) {
-                  await writer.write(encoder.encode("event: content_block_delta\ndata: " + JSON.stringify({ type: "content_block_delta", index: 0, delta: { type: "input_json_delta", partial_json: JSON.stringify(tc.function?.arguments || "") } }) + "\n\n"));
+              await writer.write(sse("content_block_delta", { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: delta.content } }));
+            }
+
+            // 工具调用增量 → 独立 tool_use content_block（按 index 累积 id/name/参数）
+            for (const tc of delta.tool_calls || []) {
+              const tcKey = (tc.index !== undefined && tc.index !== null) ? tc.index : 0;
+              let blk = toolBlocks.get(tcKey);
+              if (!blk) {
+                blk = { id: tc.id || ("toolu_" + Date.now() + "_" + tcKey), name: "", started: false, index: 1 + nextToolIndex };
+                nextToolIndex++;
+                toolBlocks.set(tcKey, blk);
+              }
+              if (tc.function?.name) blk.name += tc.function.name;
+              // 冷启动首个 delta 通常带 id+name，此时即打开 tool_use 块
+              if (!blk.started && (blk.id)) {
+                blk.started = true;
+                await writer.write(sse("content_block_start", { type: "content_block_start", index: blk.index, content_block: { type: "tool_use", id: blk.id, name: blk.name, input: {} } }));
+              }
+              const args = tc.function?.arguments;
+              if (args !== undefined && args !== null) {
+                await writer.write(sse("content_block_delta", { type: "content_block_delta", index: blk.index, delta: { type: "input_json_delta", partial_json: args } }));
+              }
+            }
+
+            // finish_reason 有值 → 关掉所有打开的块
+            if (fr) {
+              if (textBlockOpen) {
+                textBlockOpen = false;
+                await writer.write(sse("content_block_stop", { type: "content_block_stop", index: 0 }));
+              }
+              for (const blk of toolBlocks.values()) {
+                if (blk.started) {
+                  await writer.write(sse("content_block_stop", { type: "content_block_stop", index: blk.index }));
+                  blk.started = false;
                 }
               }
-            } catch {}
-          }
+            }
+          } catch {}
         }
       }
-      // 结束事件
-      await writer.write(encoder.encode("event: message_delta\ndata: " + JSON.stringify({ type: "message_delta", delta: { stop_reason: "end_turn" }, usage: { output_tokens: 0 } }) + "\n\n"));
-      await writer.write(encoder.encode("event: message_stop\ndata: " + JSON.stringify({ type: "message_stop" }) + "\n\n"));
+      // 上游没有 finish_reason 的兜底：关块
+      if (textBlockOpen) await writer.write(sse("content_block_stop", { type: "content_block_stop", index: 0 }));
+      for (const blk of toolBlocks.values()) if (blk.started) await writer.write(sse("content_block_stop", { type: "content_block_stop", index: blk.index }));
+      // 若连 message_start 都没发过（空流），补发以满足 SDK 完整性
+      if (!messageStarted) {
+        await writer.write(sse("message_start", {
+          type: "message_start",
+          message: { id: messageId, type: "message", role: "assistant", model: modelId, content: [], stop_reason: null, usage: { input_tokens: 0, output_tokens: 0 } },
+        }));
+      }
+      const stopReason = toolBlocks.size > 0 ? "tool_use" : "end_turn";
+      await writer.write(sse("message_delta", { type: "message_delta", delta: { stop_reason: stopReason, stop_sequence: null }, usage: { output_tokens: 0 } }));
+      await writer.write(sse("message_stop", { type: "message_stop" }));
     } catch (e) {
     } finally {
       try { await writer.close(); } catch {}
@@ -942,21 +1049,29 @@ async function streamResponseAnthropic(upstream) {
 // OpenAI 非流式 → Anthropic 非流式
 function openAItoAnthropic(openAI) {
   const choice = openAI?.choices?.[0];
-  const content = choice?.message?.content || "";
+  const msg = choice?.message || {};
+  const content = [];
+  const text = msg.content || "";
+  if (text) content.push({ type: "text", text });
+  for (const tc of msg.tool_calls || []) {
+    let input = {};
+    try { input = JSON.parse(tc.function?.arguments || "{}"); } catch {}
+    content.push({ type: "tool_use", id: tc.id || ("toolu_" + Date.now()), name: tc.function?.name || "", input });
+  }
+  if (content.length === 0) content.push({ type: "text", text: "" });
   return {
-    id: openAI?.id || "msg_" + Date.now(),
+    id: openAI?.id || ("msg_" + Date.now()),
     type: "message",
     role: "assistant",
     model: openAI?.model || "",
-    content: [{ type: "text", text: content }],
-    stop_reason: "end_turn",
+    content,
+    stop_reason: (msg.tool_calls?.length || 0) > 0 ? "tool_use" : "end_turn",
     usage: {
       input_tokens: openAI?.usage?.prompt_tokens || 0,
       output_tokens: openAI?.usage?.completion_tokens || 0,
     },
   };
 }
-
 // ---------------------------------------------------------------------------
 // 辅助
 // ---------------------------------------------------------------------------
