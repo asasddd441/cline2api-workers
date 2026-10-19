@@ -68,6 +68,12 @@ python3 cline_oauth.py
 
 ## 二、部署到 Cloudflare Workers
 
+[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/pingmike2/cline2api-workers)
+
+> ⚠️ **关于一键部署**：上方按钮可自动完成初始创建，但 Cloudflare 的 Git 集成偶尔会有构建环境问题，
+> 且后续更新 `CLINE_REFRESH_TOKEN` 等机密变量时可能需要手动重新部署。
+> **如果一键部署遇到不稳定的情况，仍然推荐使用下方的「复制代码粘贴部署」方式**，最稳妥。
+
 > ⚠️ **推荐方式：复制代码粘贴部署，不要用 Git 关联仓库部署。**
 > 实测 GitHub 关联 CF 部署（Git 集成）容易因入口文件/构建环境问题导致部署失败，
 > 且改环境变量后不会自动生效。用下方「复制代码」方式最稳、最快。
