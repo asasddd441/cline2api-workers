@@ -121,6 +121,10 @@ async function refreshModels() {
 // 免费 (cline-free/) 模型。这些模型走官方免费额度，不需要 credits。
 // 反之 deepseek/deepseek-v4.1-flash 是付费档，余额不足返回 402 insufficient_credits。
 // 动态刷新时同时拉这个接口，把 free 列表合并进模型池。
+// ⚠️ 只合并 data.free 分支：
+//  - data.clineCloud（如 cline-cloud/deepseek-v4.1-flash）是 Cloud Agents 浏览器沙箱专用，
+//    API 侧调用任何 UA/头组合一律 403 "only available via Cline product surfaces"（2026-10 实测），排除。
+//  - data.clinePass 需要 ClinePass 付费订阅（$9.99/月，403 ENTITLEMENT_ERROR），排除。
 // =====================================================================
 async function refreshFreeModels() {
   try {
